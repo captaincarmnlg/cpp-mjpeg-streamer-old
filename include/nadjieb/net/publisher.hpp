@@ -1,7 +1,6 @@
 #pragma once
 
 #include <nadjieb/net/socket.hpp>
-#include <nadjieb/net/topic.hpp>
 #include <nadjieb/utils/non_copyable.hpp>
 #include <nadjieb/utils/runnable.hpp>
 
@@ -21,7 +20,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
    public:
     virtual ~Publisher() { stop(); }
 
-    void start(int num_workers = std::thread::hardware_concurrency()) {
+    void start(int num_workers = 1) {
         state_ = nadjieb::utils::State::BOOTING;
         end_publisher_ = false;
         workers_.reserve(num_workers);
@@ -45,8 +44,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
             workers_.clear();
         }
 
-        topics_.clear();
-        path_by_client_.clear();
+        path2clients_.clear();
 
         while (!payloads_.empty()) {
             payloads_.pop();
@@ -54,24 +52,30 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
         state_ = nadjieb::utils::State::TERMINATED;
     }
 
-    void add(const SocketFD& sockfd, const std::string& path) {
+    void add(const std::string& path, const SocketFD& sockfd) {
         if (end_publisher_) {
             return;
         }
 
-        topics_[path].addClient(sockfd);
-
-        std::unique_lock<std::mutex> lock(path_by_client_mtx_);
-        path_by_client_[sockfd] = path;
+        const std::lock_guard<std::mutex> lock(p2c_mtx_);
+        path2clients_[path].emplace_back(NADJIEB_MJPEG_STREAMER_POLLFD{sockfd, POLLWRNORM, 0});
     }
 
-    bool pathExists(const std::string& path) { return (topics_.find(path) != topics_.end()); }
-
     void removeClient(const SocketFD& sockfd) {
-        std::unique_lock<std::mutex> lock(path_by_client_mtx_);
-        topics_[path_by_client_[sockfd]].removeClient(sockfd);
+        const std::lock_guard<std::mutex> lock(p2c_mtx_);
+        for (auto it = path2clients_.begin(); it != path2clients_.end();) {
+            it->second.erase(
+                std::remove_if(
+                    it->second.begin(), it->second.end(),
+                    [&](const NADJIEB_MJPEG_STREAMER_POLLFD& pfd) { return pfd.fd == sockfd; }),
+                it->second.end());
 
-        path_by_client_.erase(sockfd);
+            if (it->second.empty()) {
+                it = path2clients_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void enqueue(const std::string& path, const std::string& buffer) {
@@ -79,38 +83,32 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
             return;
         }
 
-        topics_[path].setBuffer(buffer);
-
-        for (const auto& client : topics_[path].getClients()) {
-            if (topics_[path].getQueueSize(client.fd) > LIMIT_QUEUE_PER_CLIENT) {
-                continue;
-            }
-
-            std::unique_lock<std::mutex> payloads_lock(payloads_mtx_);
-            payloads_.emplace(path, client);
-            topics_[path].increaseQueue(client.fd);
-            payloads_lock.unlock();
-
-            condition_.notify_one();
+        if (path2clients_.find(path) == path2clients_.end()) {
+            return;
         }
+
+        std::unique_lock<std::mutex> payloads_lock(payloads_mtx_);
+        payloads_.emplace(path, buffer);
+        payloads_lock.unlock();
+        condition_.notify_one();
     }
 
-    bool hasClient(const std::string& path) { return topics_[path].hasClient(); }
+    bool hasClient(const std::string& path) {
+        const std::lock_guard<std::mutex> lock(p2c_mtx_);
+        return path2clients_.find(path) != path2clients_.end() && !path2clients_[path].empty();
+    }
 
    private:
-    typedef std::pair<std::string, NADJIEB_MJPEG_STREAMER_POLLFD> Payload;
+    typedef std::pair<std::string, std::string> Payload;
 
     std::condition_variable condition_;
     std::vector<std::thread> workers_;
     std::queue<Payload> payloads_;
-    std::unordered_map<SocketFD, std::string> path_by_client_;
-    std::unordered_map<std::string, Topic> topics_;
+    std::unordered_map<std::string, std::vector<NADJIEB_MJPEG_STREAMER_POLLFD>> path2clients_;
     std::mutex cv_mtx_;
-    std::mutex path_by_client_mtx_;
+    std::mutex p2c_mtx_;
     std::mutex payloads_mtx_;
     bool end_publisher_ = true;
-
-    const static int LIMIT_QUEUE_PER_CLIENT = 5;
 
     void worker() {
         while (!end_publisher_) {
@@ -125,33 +123,34 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
 
             Payload payload = std::move(payloads_.front());
             payloads_.pop();
-            topics_[payload.first].decreaseQueue(payload.second.fd);
 
             payloads_lock.unlock();
             cv_lock.unlock();
 
-            auto buffer = topics_[payload.first].getBuffer();
             std::string res_str
                 = "--nadjiebmjpegstreamer\r\n"
                   "Content-Type: image/jpeg\r\n"
                   "Content-Length: "
-                  + std::to_string(buffer.size()) + "\r\n\r\n" + buffer;
+                  + std::to_string(payload.second.size()) + "\r\n\r\n" + payload.second;
 
-            auto socket_count = pollSockets(&payload.second, 1, 1);
+            const std::lock_guard<std::mutex> lock(p2c_mtx_);
+            for (auto& client : path2clients_[payload.first]) {
+                auto socket_count = pollSockets(&client, 1, 1);
 
-            if (socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
-                throw std::runtime_error("pollSockets() failed\n");
+                if (socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
+                    throw std::runtime_error("pollSockets() failed\n");
+                }
+
+                if (socket_count == 0) {
+                    continue;
+                }
+
+                if (client.revents != POLLWRNORM) {
+                    throw std::runtime_error("revents != POLLWRNORM\n");
+                }
+
+                sendViaSocket(client.fd, res_str.c_str(), res_str.size(), 0);
             }
-
-            if (socket_count == 0) {
-                continue;
-            }
-
-            if (payload.second.revents != POLLWRNORM) {
-                throw std::runtime_error("revents != POLLWRNORM\n");
-            }
-
-            sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
         }
     }
 };
