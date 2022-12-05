@@ -118,3 +118,14 @@ Please read the [contribution guidelines](CONTRIBUTING.md) before starting work 
 
 ## License
 The project is licensed under the [MIT License](LICENSE).
+## install 
+``` 
+echo "downloading nadjieb_mjpeg_streamer...";
+ git clone https://github.com/nadjieb/cpp-mjpeg-streamer.git;
+ cd cpp-mjpeg-streamer;
+ mkdir build && cd build;
+ echo "compiling nadjieb_mjpeg_streamer..."
+ cmake ../;
+ make;
+ sudo make install;
+```
